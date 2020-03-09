@@ -176,10 +176,10 @@ ifeq (1,$(OMR_DEBUG))
     GLOBAL_CFLAGS+=-ggdb
     GLOBAL_LDFLAGS+=-ggdb
   else
-    GLOBAL_ASFLAGS+=-g
-    GLOBAL_CXXFLAGS+=-g
-    GLOBAL_CFLAGS+=-g
-    GLOBAL_LDFLAGS+=-g
+    GLOBAL_ASFLAGS+=-g3
+    GLOBAL_CXXFLAGS+=-g3
+    GLOBAL_CFLAGS+=-g3
+    GLOBAL_LDFLAGS+=-g3
   endif
 endif
 
