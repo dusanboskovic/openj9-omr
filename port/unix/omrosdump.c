@@ -41,6 +41,10 @@
 #include "omrportpriv.h"
 #include "omrosdump_helpers.h"
 
+#if defined(OSX)
+#include "gcore.h"
+#endif
+
 #if 0
 #define DUMP_DBG
 #endif
@@ -135,6 +139,18 @@ omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpTyp
 	 */
 	unlimitCoreFileSize(portLibrary);
 
+#if defined(LINUX) || defined(OSX)
+#define J9_DUMP_SIGNAL  SIGSEGV
+#else /* defined(LINUX) || defined(OSX) */
+#define J9_DUMP_SIGNAL  SIGABRT
+#endif /* defined(LINUX) || defined(OSX) */
+
+#if defined(OSX)
+/* OSX can't use a signal to dump core without extra entitlements, 
+	so we need to manually suspend and dump the core */
+	
+#else /* OSX */
+
 	/* fork a child process from which we'll dump a core file */
 	pid = fork();
 	if (0 == pid) {
@@ -162,11 +178,6 @@ omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpTyp
 		/*
 		 * CMVC 95748: don't use abort() after fork() on Linux as this seems to upset certain levels of glibc
 		 */
-#if defined(LINUX) || defined(OSX)
-#define J9_DUMP_SIGNAL  SIGSEGV
-#else /* defined(LINUX) || defined(OSX) */
-#define J9_DUMP_SIGNAL  SIGABRT
-#endif /* defined(LINUX) || defined(OSX) */
 
 		/* Ensure we get default action (core) - reset primary&app handlers */
 		OMRSIG_SIGNAL(J9_DUMP_SIGNAL, SIG_DFL);
@@ -184,12 +195,16 @@ omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpTyp
 			}
 		}
 
-#if defined(LINUX) || defined(OSX)
+#if defined(LINUX)
 		pthread_kill(pthread_self(), J9_DUMP_SIGNAL);
-#endif /* defined(LINUX) || defined(OSX) */
+#elif defined(OSX)
+		dump_core();
+#endif /* defined(LINUX) */
+
 
 		abort();
 	} /* end of child process */
+#endif /* OSX */
 
 	/* We are now in the parent process. First check that the fork() worked OK (CMVC 130439) */
 	if (pid < 0) {
