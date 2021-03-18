@@ -226,7 +226,10 @@ if(OMR_OS_AIX)
 elseif(OMR_OS_LINUX)
 	list(APPEND OBJECTS omrosdump_helpers.c)
 elseif(OMR_OS_OSX)
-	list(APPEND OBJECTS omrosdump_helpers.c)
+	list(APPEND OBJECTS 
+		omrosdump_helpers.c
+		gcore.c
+	)
 elseif(OMR_OS_ZOS)
 	if(NOT OMR_ENV_DATA64)
 		list(APPEND OBJECTS
