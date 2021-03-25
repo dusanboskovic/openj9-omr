@@ -148,7 +148,7 @@ omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpTyp
 #if defined(OSX)
 /* OSX can't use a signal to dump core without extra entitlements, 
 	so we need to manually suspend and dump the core */
-	
+	dump_core();
 #else /* OSX */
 
 	/* fork a child process from which we'll dump a core file */
@@ -197,8 +197,6 @@ omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpTyp
 
 #if defined(LINUX)
 		pthread_kill(pthread_self(), J9_DUMP_SIGNAL);
-#elif defined(OSX)
-		dump_core();
 #endif /* defined(LINUX) */
 
 

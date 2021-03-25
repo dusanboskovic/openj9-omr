@@ -42,6 +42,7 @@
 #include <mach-o/loader.h>
 #include "gcore.h"
 
+#define SPECIAL_PORT TASK_BOOTSTRAP_PORT
 #define CAST_DOWN(type, addr) (((type)((uintptr_t)(addr))))
 
 typedef struct {
@@ -115,7 +116,7 @@ static int  get_process_info(pid_t, struct kinfo_proc *);
 static int  get_processor_type(cpu_type_t *, cpu_subtype_t *);
 static int  get_thread_status(register thread_t, int, thread_state_t, mach_msg_type_number_t *);
 static int  task_iterate_threads(task_t, thread_callback_t, void *);
-static int  coredump_to_file(const char *);
+static int  coredump_to_file(const char *, pid_t);
 
 /* globals */
 static mach_port_t target_task = MACH_PORT_NULL;
@@ -210,26 +211,7 @@ static int get_processor_type(cpu_type_t *cpu_type, cpu_subtype_t *cpu_subtype)
     *cpu_subtype = CPU_SUBTYPE_MULTIPLE;
 
     host = mach_host_self();
-    host_priv = host_get_host_priv_port(host, &host_priv);
 
-    if (kr != KERN_SUCCESS) {
-        mach_error("host_get_host_priv_port:", kr);
-        goto out;
-    }
-
-    processor_list = (processor_port_array_t)0;
-    /*
-    kr = host_processors(host_priv, &processor_list, &processor_count);
-
-    if (kr != KERN_SUCCESS) {
-        mach_error("host_processors:", kr);
-        goto out;
-    }
-
-    info_count = PROCESSOR_BASIC_INFO_COUNT;
-    kr = processor_info(processor_list[0], PROCESSOR_BASIC_INFO, &host,
-                        (processor_info_t)&basic_info, &info_count);
-    */
     info_count = PROCESSOR_BASIC_INFO_COUNT;
     kr = host_processor_info(host, PROCESSOR_BASIC_INFO, &processor_count, (processor_info_array_t*)&procinfo_list, &info_count);
 
@@ -237,6 +219,8 @@ static int get_processor_type(cpu_type_t *cpu_type, cpu_subtype_t *cpu_subtype)
         basic_info = procinfo_list[0];
         *cpu_type = basic_info.cpu_type;
         *cpu_subtype = basic_info.cpu_subtype;
+    } else {
+        goto out;
     }
 
 out:
@@ -251,6 +235,11 @@ out:
     if (processor_list) {
         (void)vm_deallocate(mach_task_self(), (vm_address_t)processor_list,
                             processor_count * sizeof(processor_t *));
+    }
+
+    if (procinfo_list) {
+        (void)vm_deallocate(mach_task_self(), (vm_address_t)procinfo_list,
+                            processor_count * sizeof(processor_basic_info_t));
     }
 
     return kr;
@@ -346,7 +335,7 @@ static int task_iterate_threads(task_t task,
     return KERN_SUCCESS;
 }
 
-static int coredump_to_file(const char *corefilename)
+static int coredump_to_file(const char *corefilename, pid_t pid)
 {
     unsigned int i;
     int error = 0, error1 = 0;
@@ -383,20 +372,11 @@ static int coredump_to_file(const char *corefilename)
 
     struct kinfo_proc kp;
 
-    pid_t pid = getpid();
-
     kr = get_processor_type(&cpu_type, &cpu_subtype);
     if (kr != KERN_SUCCESS) {
         fprintf(stderr, "failed to get processor type (%d)\n", kr);
         return kr;
     }
-
-    /*kr = task_for_pid(mach_task_self(), pid, &target_task);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "failed to find task for process %d\n", pid);
-        return kr;
-    }*/
-    target_task = mach_task_self();
 
     kr = get_process_info(pid, &kp);
     if (kr) {
@@ -416,7 +396,7 @@ static int coredump_to_file(const char *corefilename)
     segment_command_sz = sizeof(struct segment_command);
 #endif
 
-    //(void)task_suspend(target_task);
+    (void)task_suspend(target_task);
 
     corefile_fd = open(corefilename, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (corefile_fd < 0) {
@@ -639,24 +619,59 @@ out:
 }
 
 
+
 int dump_core(void)
 {
     kern_return_t kr;
-    pid_t pid;
-    pid = getpid();
+    pid_t pid, parent_pid, child_pid;
+    mach_port_t pass_port = MACH_PORT_NULL;
+    mach_port_t special_port = MACH_PORT_NULL;
 
+    parent_pid = getpid();
     if (!corefile_path[0]) {
-        snprintf(corefile_path, MAXPATHLEN, "core.%u", pid);
+        snprintf(corefile_path, MAXPATHLEN, "core.%u", parent_pid);
     }
 
-    // Setup signal handler
+    /* pass parent task port to child through special port inheritance */
+    kr = task_get_special_port(mach_task_self(), SPECIAL_PORT, &special_port);
+    if(kr != KERN_SUCCESS) {
+        mach_error("failed get special port:\n", kr);
+        return kr;
+    }
+    pass_port = mach_task_self();
+    kr = task_set_special_port(mach_task_self(), SPECIAL_PORT, pass_port);
+    if(kr != KERN_SUCCESS) {
+        mach_error("failed set special port:\n", kr);
+        return kr;
+    }
+
     _setup_sighandler();
 
-    kr = coredump_to_file(corefile_path);
-    if (kr != KERN_SUCCESS) {
-        fprintf(stderr, "failed to dump core for process %d (%d)\n", pid, kr);
-        exit(kr);
+    pid = fork();
+
+    if (0 == pid) { /* in child process */
+        child_pid = getpid();
+        kr = task_get_special_port(mach_task_self(), SPECIAL_PORT, &pass_port);
+        if(kr != KERN_SUCCESS) {
+            mach_error("failed get special port:\n", kr);
+            return kr;
+        }
+        target_task = pass_port;
+        kr = coredump_to_file(corefile_path, parent_pid);
+        if (kr != KERN_SUCCESS) {
+            fprintf(stderr, "failed to dump core for process %d (%d)\n", child_pid, kr);
+            exit(kr);
+        }
+    } else if (pid > 0) {
+        waitpid(pid, NULL, 0);
+        kr = task_set_special_port(mach_task_self(), SPECIAL_PORT, special_port);
+        if(kr != KERN_SUCCESS)
+        {
+            mach_error("failed set special port:\n", kr);
+            return kr;
+        }
     }
+
 
     exit(0);
 }

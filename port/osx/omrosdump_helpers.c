@@ -66,7 +66,7 @@ renameDump(struct OMRPortLibrary *portLibrary, char *filename, pid_t pid, int si
 	intptr_t renameRC = -1;
 	struct stat attrBuf;
 
-	portLibrary->str_printf(portLibrary, derivedAbsoluteCorePath, PATH_MAX, "/cores/core.%i", pid);
+	portLibrary->str_printf(portLibrary, derivedAbsoluteCorePath, PATH_MAX, "core.%i", pid);
 
 	/* Wait until the core file is created or timeout */
 	waitCoreRC = waitCore(derivedAbsoluteCorePath);
