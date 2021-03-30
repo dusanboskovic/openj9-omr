@@ -258,7 +258,7 @@ static int get_vmmap_entries(task_t task)
     kern_return_t kr      = KERN_SUCCESS;
     vm_address_t  address = 0;
     vm_size_t     size    = 0;
-    int           n       = 1;
+    int           n       = 0;
 
     while (1) {
         mach_msg_type_number_t          count;
