@@ -50,11 +50,22 @@
 #include "omrportpriv.h"
 #include "omrosdump_helpers.h"
 
+/* full thread command for x86_64, with thread state flavors
+ * currently needed for debugging
+ */
+struct thread_command_full_64 {
+	uint32_t cmd;
+	uint32_t cmdsize;
+	x86_thread_state_t thread_state;
+	x86_float_state_t float_state;
+	x86_exception_state_t exceptions;
+};
+
 static char corefile_name[PATH_MAX];
 static int corefile_fd = -1;
 
 static int coredump_to_file(mach_port_t, pid_t);
-static int dump_threads_to_file(mach_port_t, uint32_t *, uint32_t *);
+static int list_thread_commands(mach_port_t, struct thread_command_full_64 **, natural_t *);
 
 static void exit_coredump(void) {
 	raise(SIGKILL);
@@ -64,7 +75,8 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 	kern_return_t kr = KERN_SUCCESS;
 	struct mach_header_64 *mh64;
 	struct segment_command_64 *segments = NULL;
-	struct thread_command *threads = NULL;
+	struct thread_command_full_64 *threads = NULL;
+	natural_t thread_count;
 	natural_t cpu_count;
     processor_basic_info_t proc_info_array;
     mach_msg_type_number_t info_count;
@@ -91,16 +103,44 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 	mh64->magic = MH_MAGIC_64;
 	mh64->cputype = proc_info_array[0].cpu_type;
 	mh64->cpusubtype = proc_info_array[0].cpu_subtype;
-	// update ncmds and sizeofcmds later when we figure out size
+	// update ncmds and sizeofcmds after processing thread and segment commands
 	mh64->ncmds = 0;
-	mh64->sizeofcmds = 0;
+	mh64->sizeofcmds = 32;
 	mh64->filetype = MH_CORE;
 
-	pwrite(corefile_fd, mh64, sizeof(struct mach_header_64), file_off);
-	fileoff += sizeof(struct mach_header_64);
-
+	file_off += sizeof(struct mach_header_64);
 	segments = NULL;
-	kr = dump_threads_to_file(task_port, threads);
+	kr = list_thread_commands(task_port, &threads, &thread_count);
+	if (kr != KERN_SUCCESS) {
+		mach_error("error getting thread command data:\n", kr);
+	}
+
+	fprintf(stderr, "write threads: size: %lu, offset: %llu\n", sizeof(struct thread_command_full_64) * thread_count, file_off);
+	fprintf(stderr,"expected counts -  thread: %u, float: %u, except: %u\n", x86_THREAD_STATE64_COUNT, x86_FLOAT_STATE64_COUNT, x86_EXCEPTION_STATE64_COUNT);
+	fprintf(stderr,"struct sizes -  thread: %lu, float: %lu, except: %lu, all: %lu\n", sizeof(x86_thread_state_t), sizeof(x86_float_state_t), sizeof(x86_exception_state_t), sizeof(struct thread_command_full_64));
+
+	for (int i = 0; i < thread_count; i++) {
+		fprintf(stderr, "thread %d - command %u, size: %u\n", i, threads[i].cmd, threads[i].cmdsize);
+		fprintf(stderr, "  thread - threadstate %u, count: %u\n", threads[i].thread_state.tsh.flavor, threads[i].thread_state.tsh.count);
+		fprintf(stderr, "  thread - floatstate %u, count: %u\n", threads[i].float_state.fsh.flavor, threads[i].float_state.fsh.count);
+		fprintf(stderr, "  thread - exceptionstate %u, count: %u\n", threads[i].exceptions.esh.flavor, threads[i].exceptions.esh.count);
+		pwrite(corefile_fd, &threads[i].cmd, 4, file_off);
+		pwrite(corefile_fd, &threads[i].cmdsize, 4, file_off + 4);
+		file_off += 8;
+		pwrite(corefile_fd, &threads[i].thread_state, sizeof(x86_thread_state_t), file_off);
+		file_off += sizeof(x86_thread_state_t);
+		pwrite(corefile_fd, &threads[i].float_state, sizeof(x86_float_state_t), file_off);
+		file_off += sizeof(x86_float_state_t);
+		pwrite(corefile_fd, &threads[i].exceptions, sizeof(x86_exception_state_t), file_off);
+		file_off += sizeof(x86_exception_state_t);
+		mh64->sizeofcmds += threads[i].cmdsize;
+
+	}
+	mh64->ncmds += thread_count;
+
+	//write mach header after all command number and size are known
+	pwrite(corefile_fd, mh64, sizeof(struct mach_header_64), 0);
+
 
 
 done:
@@ -110,9 +150,58 @@ done:
 	return kr;
 }
 
-static int dump_threads_to_file(mach_port_t task_port, struct thread_command *threads) {
-	
+static int list_thread_commands(mach_port_t task_port, struct thread_command_full_64 **thread_commands, natural_t *thread_count) {
+	kern_return_t kr = KERN_SUCCESS;
+	thread_act_array_t thread_info;
+	struct thread_command_full_64 *threads = NULL;
 
+	kr = task_threads(task_port, &thread_info, thread_count);
+
+	if (kr != KERN_SUCCESS) {
+		mach_error("task_thread failed with: ", kr);
+		return kr;
+	}
+
+	if (NULL == threads) {
+		threads = calloc(*thread_count, sizeof(struct thread_command_full_64));
+		if (NULL == threads) {
+			kr = KERN_NO_SPACE;
+			goto done;
+		}
+	}
+
+	for (int i = 0; i < *thread_count; i++) {
+		uint32_t state_int_count;
+		threads[i].cmd = LC_THREAD;
+		threads[i].cmdsize = 8;
+		state_int_count = x86_THREAD_STATE_COUNT;
+		kr = thread_get_state(thread_info[i], x86_THREAD_STATE, (thread_state_t)&threads[i].thread_state, &state_int_count);
+		if (kr != KERN_SUCCESS) {
+			goto done;
+		}
+		threads[i].cmdsize += state_int_count * 4;
+		state_int_count = x86_FLOAT_STATE_COUNT;
+		kr = thread_get_state(thread_info[i], x86_FLOAT_STATE, (thread_state_t)&threads[i].float_state, &state_int_count);
+		if (kr != KERN_SUCCESS) {
+			goto done;
+		}
+		threads[i].cmdsize += state_int_count * 4;
+		state_int_count = x86_EXCEPTION_STATE_COUNT;
+		kr = thread_get_state(thread_info[i], x86_EXCEPTION_STATE, (thread_state_t)&threads[i].exceptions, &state_int_count);
+		if (kr != KERN_SUCCESS) {
+			goto done;
+		}
+		threads[i].cmdsize += state_int_count * 4;
+	}
+	if (KERN_SUCCESS == kr) {
+		*thread_commands = threads;
+	}
+
+done:
+	for (int i = 0; i < *thread_count; i++) {
+		mach_port_deallocate(mach_task_self(), thread_info[i]);
+	}
+	return kr;
 }
 
 /**
