@@ -66,6 +66,8 @@ static int corefile_fd = -1;
 
 static int coredump_to_file(mach_port_t, pid_t);
 static int list_thread_commands(mach_port_t, struct thread_command_full_64 **, natural_t *);
+static int list_segment_commands(mach_port_t, struct segment_command_64 **, natural_t *);
+
 
 static void exit_coredump(void) {
 	raise(SIGKILL);
@@ -76,11 +78,14 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 	struct mach_header_64 *mh64;
 	struct segment_command_64 *segments = NULL;
 	struct thread_command_full_64 *threads = NULL;
+	natural_t segment_count;
 	natural_t thread_count;
 	natural_t cpu_count;
     processor_basic_info_t proc_info_array;
     mach_msg_type_number_t info_count;
 	off_t file_off = 0;
+	uint64_t seg_file_off = 0;
+
 
 
 	int err = 0;
@@ -115,15 +120,7 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 		mach_error("error getting thread command data:\n", kr);
 	}
 
-	fprintf(stderr, "write threads: size: %lu, offset: %llu\n", sizeof(struct thread_command_full_64) * thread_count, file_off);
-	fprintf(stderr,"expected counts -  thread: %u, float: %u, except: %u\n", x86_THREAD_STATE64_COUNT, x86_FLOAT_STATE64_COUNT, x86_EXCEPTION_STATE64_COUNT);
-	fprintf(stderr,"struct sizes -  thread: %lu, float: %lu, except: %lu, all: %lu\n", sizeof(x86_thread_state_t), sizeof(x86_float_state_t), sizeof(x86_exception_state_t), sizeof(struct thread_command_full_64));
-
 	for (int i = 0; i < thread_count; i++) {
-		fprintf(stderr, "thread %d - command %u, size: %u\n", i, threads[i].cmd, threads[i].cmdsize);
-		fprintf(stderr, "  thread - threadstate %u, count: %u\n", threads[i].thread_state.tsh.flavor, threads[i].thread_state.tsh.count);
-		fprintf(stderr, "  thread - floatstate %u, count: %u\n", threads[i].float_state.fsh.flavor, threads[i].float_state.fsh.count);
-		fprintf(stderr, "  thread - exceptionstate %u, count: %u\n", threads[i].exceptions.esh.flavor, threads[i].exceptions.esh.count);
 		pwrite(corefile_fd, &threads[i].cmd, 4, file_off);
 		pwrite(corefile_fd, &threads[i].cmdsize, 4, file_off + 4);
 		file_off += 8;
@@ -137,6 +134,44 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 
 	}
 	mh64->ncmds += thread_count;
+
+
+	kr = list_segment_commands(task_port, &segments, &segment_count);
+	if (kr != KERN_SUCCESS) {
+		mach_error("error getting thread command data:\n", kr);
+	}
+	seg_file_off = file_off + segment_count * sizeof(struct segment_command_64);
+	for (int i = 0; i < segment_count; i++) {
+		vm_offset_t data_read;
+		mach_msg_type_number_t data_size;
+
+		segments[i].fileoff = seg_file_off;
+		pwrite(corefile_fd, &segments[i], sizeof(struct segment_command_64), file_off);
+
+		if ((segments[i].initprot & VM_PROT_READ) == 0) {
+			mach_vm_protect(task_port, segments[i].vmaddr, segments[i].vmsize, FALSE, segments[i].initprot | VM_PROT_READ);
+		}
+
+		if ((segments[i].maxprot & VM_PROT_READ) == VM_PROT_READ) {
+			kr = mach_vm_read(task_port, segments[i].vmaddr, segments[i].vmsize, &data_read, &data_size);
+			if (kr != KERN_SUCCESS) {
+				fprintf(stderr, "segment %u: ", i);
+				mach_error("error reading memory segment\n", kr);
+			} 
+			else if (data_size != segments[i].vmsize) {
+				fprintf(stderr, "segment %u xpected %llu bytes, read %u\n", i, segments[i].vmsize, data_size);
+			} else {
+				pwrite(corefile_fd, (void *)data_read, data_size, seg_file_off);
+			}
+			mach_vm_deallocate(task_port, data_read, data_size);
+		}
+
+		file_off += sizeof(struct segment_command_64);
+		seg_file_off += segments[i].vmsize;
+	}
+	mh64->ncmds += segment_count;
+	mh64->sizeofcmds += segment_count * sizeof(struct segment_command_64);
+
 
 	//write mach header after all command number and size are known
 	pwrite(corefile_fd, mh64, sizeof(struct mach_header_64), 0);
@@ -162,12 +197,10 @@ static int list_thread_commands(mach_port_t task_port, struct thread_command_ful
 		return kr;
 	}
 
+	threads = calloc(*thread_count, sizeof(struct thread_command_full_64));
 	if (NULL == threads) {
-		threads = calloc(*thread_count, sizeof(struct thread_command_full_64));
-		if (NULL == threads) {
-			kr = KERN_NO_SPACE;
-			goto done;
-		}
+		kr = KERN_NO_SPACE;
+		goto done;
 	}
 
 	for (int i = 0; i < *thread_count; i++) {
@@ -203,6 +236,90 @@ done:
 	}
 	return kr;
 }
+
+static int list_segment_commands(mach_port_t task_port, struct segment_command_64 **segment_commands, natural_t *segment_count) {
+	kern_return_t kr = KERN_SUCCESS;
+	struct segment_command_64 *segments = NULL;
+	*segment_count = 0;
+	uint32_t depth = 0;
+	vm_region_submap_info_data_64_t vm_info;
+
+	vm_address_t address = 0;
+	while (1) {
+		vm_size_t size = 0;
+		mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		kr = vm_region_recurse_64(task_port, &address, &size, &depth, (vm_region_info_t)&vm_info, &info_count);
+
+		if (kr) {
+			fprintf(stderr, "end of memory\n");
+			break;
+		}
+
+		if (vm_info.is_submap) {
+            depth++;
+        } else {
+            address += size;
+            (*segment_count)++;
+        }
+
+	}
+	if (kr == KERN_INVALID_ADDRESS) {
+		kr = KERN_SUCCESS;
+	}
+	fprintf(stderr, "segment count: %u\n", *segment_count );
+
+	segments = calloc(*segment_count, sizeof(struct segment_command_64));
+	address = 0;
+	depth = 0;
+	for (int i = 0; i < *segment_count; i++) {
+		vm_size_t size = 0;
+		kern_return_t read_err;
+		
+		while(1) {
+			mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+			read_err = vm_region_recurse_64(task_port, &address, &size, &depth, (vm_region_info_t)&vm_info, &info_count);
+			
+			if (vm_info.is_submap) {
+				depth++;
+				continue;
+			} else {
+				break;
+			}
+			if (read_err != KERN_SUCCESS) {
+				break;
+			}
+		}
+
+		if (read_err != KERN_SUCCESS && read_err != KERN_INVALID_ADDRESS) {
+			mach_error("failed to get region: \n", read_err);
+			kr = read_err;
+			break;
+		}
+		fprintf(stderr, "segment %u, curr addr: %lu, size: %lu\n", i, address, size );
+		if (vm_info.user_tag == VM_MEMORY_IOKIT) {
+			fprintf(stderr, "segment %u, iokit memory\n", i);
+		}
+
+		segments[i].cmd        = LC_SEGMENT_64;
+		segments[i].cmdsize    = sizeof(struct segment_command_64);
+		segments[i].segname[0] = 0;
+		segments[i].vmaddr     = address;
+		segments[i].vmsize     = size;
+		segments[i].fileoff    = 0; /* get correct offset while writing headers */
+		segments[i].filesize   = size;
+		segments[i].maxprot    = vm_info.max_protection;
+		segments[i].initprot   = vm_info.protection;
+		segments[i].nsects     = 0;
+
+		address += size;
+	}
+	if (kr == KERN_SUCCESS) {
+		*segment_commands = segments;
+	}
+
+	return kr;
+}
+
 
 /**
  * Create a dump file of the OS state.
