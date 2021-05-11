@@ -74,7 +74,6 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 	struct segment_command_64 *segments = NULL;
 	struct thread_command_full_64 *threads = NULL;
 	natural_t segment_count;
-	natural_t segments_skipped = 0;
 	natural_t thread_count;
 	natural_t cpu_count;
     processor_basic_info_t proc_info_array;
@@ -82,14 +81,9 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 	off_t file_off = 0;
 	uint64_t seg_file_off = 0;
 
-
-
-	int err = 0;
-
 	corefile_fd = open(corefile_name, O_RDWR | O_CREAT | O_EXCL, 0600);
 
 	if (-1 == corefile_fd) {
-		err = errno;
 		perror("open()");
 		goto done;
 	}
@@ -141,11 +135,6 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 		vm_offset_t data_read;
 		mach_msg_type_number_t data_size;
 
-		if ((segments[i].initprot & VM_PROT_READ) != VM_PROT_READ) {
-			segments_skipped++;
-			continue;
-		}
-
 		segments[i].fileoff = seg_file_off;
 		pwrite(corefile_fd, &segments[i], sizeof(struct segment_command_64), file_off);
 
@@ -168,8 +157,8 @@ static int coredump_to_file(mach_port_t task_port, pid_t pid) {
 		file_off += sizeof(struct segment_command_64);
 		seg_file_off += segments[i].vmsize;
 	}
-	mh64->ncmds += segment_count - segments_skipped;
-	mh64->sizeofcmds += (segment_count - segments_skipped) * sizeof(struct segment_command_64);
+	mh64->ncmds += segment_count;
+	mh64->sizeofcmds += segment_count * sizeof(struct segment_command_64);
 
 
 	//write mach header after all command number and size are known
@@ -239,64 +228,83 @@ done:
 static int list_segment_commands(mach_port_t task_port, struct segment_command_64 **segment_commands, natural_t *segment_count) {
 	kern_return_t kr = KERN_SUCCESS;
 	struct segment_command_64 *segments = NULL;
-	*segment_count = 0;
+	struct segment_command_64 *tmp_segments = NULL;
 	uint32_t depth = 0;
 	vm_region_submap_info_data_64_t vm_info;
+	natural_t segment_array_size = 128;
+	*segment_count = 0;
+
+	segments = calloc(segment_array_size, sizeof(struct segment_command_64));
 
 	vm_address_t address = 0;
 	while (1) {
 		vm_size_t size = 0;
 		mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		vm_offset_t data_read;
+		mach_msg_type_number_t data_size;
+
+		if ((*segment_count) >= segment_array_size) {
+			segment_array_size += segment_array_size / 2;
+			tmp_segments = calloc(segment_array_size, sizeof(struct segment_command_64));
+			memcpy(tmp_segments, segments, (*segment_count) * sizeof(struct segment_command_64));
+			free(segments);
+			segments = tmp_segments;
+			tmp_segments = NULL;
+		}
+
+		fprintf(stderr, "recurse start segment %u, curr addr: %lu, size: %lu\n", (*segment_count), address, size );
+
 		kr = vm_region_recurse_64(task_port, &address, &size, &depth, (vm_region_info_t)&vm_info, &info_count);
 
 		if (kr) {
-			fprintf(stderr, "end of memory\n");
+			mach_error("end of memory\n", kr);
 			break;
 		}
 
+		fprintf(stderr, "region @ segment %u, curr addr: %lu, size: %lu memtag: %u, submap: %u\n", (*segment_count), address, size, vm_info.user_tag, vm_info.is_submap );
+
+		if (vm_info.is_submap) {
+			depth++;
+			fprintf(stderr, "setting depth to %u and recursing\n", depth);
+			continue;
+		}
+
+
+		kr = mach_vm_read(task_port, address, size, &data_read, &data_size);
+		if (kr) {
+			fprintf(stderr, "error reading segment %u", (*segment_count));
+			mach_error("\n", kr);
+		} else {
+			mach_vm_deallocate(task_port, data_read, data_size);
+		}
+
+		segments[(*segment_count)].cmd        = LC_SEGMENT_64;
+		segments[(*segment_count)].cmdsize    = sizeof(struct segment_command_64);
+		segments[(*segment_count)].segname[0] = 0;
+		segments[(*segment_count)].vmaddr     = address;
+		segments[(*segment_count)].vmsize     = size;
+		segments[(*segment_count)].fileoff    = 0; /* get correct offset while writing headers */
+		segments[(*segment_count)].filesize   = size;
+		segments[(*segment_count)].maxprot    = vm_info.max_protection;
+		segments[(*segment_count)].initprot   = vm_info.protection;
+		segments[(*segment_count)].nsects     = 0;
+		if (kr == KERN_SUCCESS) {
+			(*segment_count)++;
+		}
 		address += size;
-		(*segment_count)++;
 	}
 	if (kr == KERN_INVALID_ADDRESS) {
 		kr = KERN_SUCCESS;
 	}
 	fprintf(stderr, "segment count: %u\n", *segment_count );
 
-	segments = calloc(*segment_count, sizeof(struct segment_command_64));
-	address = 0;
-	depth = 0;
-	for (int i = 0; i < *segment_count; i++) {
-		vm_size_t size = 0;
-		kern_return_t read_err;
-		
-		mach_msg_type_number_t info_count = VM_REGION_SUBMAP_INFO_COUNT_64;
-		read_err = vm_region_recurse_64(task_port, &address, &size, &depth, (vm_region_info_t)&vm_info, &info_count);
-
-		if (read_err != KERN_SUCCESS && read_err != KERN_INVALID_ADDRESS) {
-			mach_error("failed to get region: \n", read_err);
-			kr = read_err;
-			break;
-		}
-		fprintf(stderr, "segment %u, curr addr: %lu, size: %lu memtag: %u\n", i, address, size, vm_info.user_tag );
-		if (vm_info.user_tag == VM_MEMORY_IOKIT) {
-			fprintf(stderr, "segment %u, iokit memory\n", i);
-		}
-
-		segments[i].cmd        = LC_SEGMENT_64;
-		segments[i].cmdsize    = sizeof(struct segment_command_64);
-		segments[i].segname[0] = 0;
-		segments[i].vmaddr     = address;
-		segments[i].vmsize     = size;
-		segments[i].fileoff    = 0; /* get correct offset while writing headers */
-		segments[i].filesize   = size;
-		segments[i].maxprot    = vm_info.max_protection;
-		segments[i].initprot   = vm_info.protection;
-		segments[i].nsects     = 0;
-
-		address += size;
-	}
 	if (kr == KERN_SUCCESS) {
-		*segment_commands = segments;
+		tmp_segments = calloc((*segment_count), sizeof(struct segment_command_64));
+		memcpy(tmp_segments, segments, (*segment_count) * sizeof(struct segment_command_64));
+		free(segments);
+		*segment_commands = tmp_segments;
+
+
 	}
 
 	return kr;
