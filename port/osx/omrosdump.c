@@ -367,16 +367,15 @@ omrdump_create(struct OMRPortLibrary *portLibrary, char *filename, char *dumpTyp
 
 	child_pid = fork();
 	if (0 == child_pid) { /* in child process */
- 		child_pid = getpid();
         kr = task_get_bootstrap_port(mach_task_self(), &pass_port);
         if(kr != KERN_SUCCESS) {
             mach_error("failed get special port:\n", kr);
             return kr;
         }
-        task_suspend(pass_port);
+        //task_suspend(pass_port);
 
 		kr = coredump_to_file(pass_port, parent_pid);
-		task_resume(pass_port);
+		//task_resume(pass_port);
 		raise(SIGKILL);
 	} else { /* in parent process */
 		waitpid(child_pid, NULL, 0);
